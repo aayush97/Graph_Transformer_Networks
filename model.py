@@ -37,9 +37,9 @@ class GTN(nn.Module):
         nn.init.zeros_(self.bias)
 
     def gcn_conv(self,X,H):
-        X = torch.mm(X, self.weight)
-        H = self.norm(H, add=True)
-        return torch.mm(H.t(),X)
+        X = torch.mm(X, self.weight) # linear transform : N x w_out
+        H = self.norm(H, add=True) # normalize D^(-1)H: N x N 
+        return torch.mm(H.t(),X) # N x w_out, why transpose?
 
     def normalization(self, H):
         for i in range(self.num_channels):
@@ -50,6 +50,8 @@ class GTN(nn.Module):
         return H_
 
     def norm(self, H, add=False):
+        # D^(-1)H
+        # D: degree matrix
         H = H.t()
         if add == False:
             H = H*((torch.eye(H.shape[0])==0).type(torch.FloatTensor))
@@ -64,7 +66,11 @@ class GTN(nn.Module):
         return H
 
     def forward(self, A, X, target_x, target):
-        A = A.unsqueeze(0).permute(0,3,1,2) 
+        # A: adjacency matrix: (N,N,K)
+        # X: feature matrix for each node: (N,D)
+        # target_x: node indices to classify or map or sth
+        # target: target value for the nodes in target_x
+        A = A.unsqueeze(0).permute(0,3,1,2) # 1 x K x N x N
         Ws = []
         for i in range(self.num_layers):
             if i == 0:
@@ -81,13 +87,16 @@ class GTN(nn.Module):
         #H,W3 = self.layer3(A, H)
         for i in range(self.num_channels):
             if i==0:
-                X_ = F.relu(self.gcn_conv(X,H[i]))
+                X_ = F.relu(self.gcn_conv(X,H[i])) # take weighted average linearly transformed node representations with metapaths
+                # analogous to attention through computed metapaths on linearly transformed node representations
+                # X_.shape = N, w_out
             else:
                 X_tmp = F.relu(self.gcn_conv(X,H[i]))
-                X_ = torch.cat((X_,X_tmp), dim=1)
-        X_ = self.linear1(X_)
-        X_ = F.relu(X_)
-        y = self.linear2(X_[target_x])
+                X_ = torch.cat((X_,X_tmp), dim=1) # similar to multi attention heads in transformer
+        # X_.shape = N, w_out * num_channels 
+        X_ = self.linear1(X_) # linear transform
+        X_ = F.relu(X_) 
+        y = self.linear2(X_[target_x]) # target_x * num_classes
         loss = self.loss(y, target)
         return loss, y, Ws
 
@@ -95,9 +104,9 @@ class GTLayer(nn.Module):
     
     def __init__(self, in_channels, out_channels, first=True):
         super(GTLayer, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.first = first
+        self.in_channels = in_channels # types of input edges/metapaths, ~ number of input adjacency matrices
+        self.out_channels = out_channels # types of output edges/metapaths ~ number of output adjacency matrices
+        self.first = first # is first layer
         if self.first == True:
             self.conv1 = GTConv(in_channels, out_channels)
             self.conv2 = GTConv(in_channels, out_channels)
@@ -106,14 +115,14 @@ class GTLayer(nn.Module):
     
     def forward(self, A, H_=None):
         if self.first == True:
-            a = self.conv1(A)
-            b = self.conv2(A)
-            H = torch.bmm(a,b)
-            W = [(F.softmax(self.conv1.weight, dim=1)).detach(),(F.softmax(self.conv2.weight, dim=1)).detach()]
+            a = self.conv1(A) # weighted average of different adjacency matrices
+            b = self.conv2(A) # weighted average of different adjacency matrices
+            H = torch.bmm(a,b) # meta-path from adjacency matrix a to b
+            W = [(F.softmax(self.conv1.weight, dim=1)).detach(),(F.softmax(self.conv2.weight, dim=1)).detach()] # weights for combinining adjacency matrices, only used for interpretability
         else:
-            a = self.conv1(A)
-            H = torch.bmm(H_,a)
-            W = [(F.softmax(self.conv1.weight, dim=1)).detach()]
+            a = self.conv1(A) # weighted average of different adjancecy matrices
+            H = torch.bmm(H_,a) # meta-path from previous layer meta path to a
+            W = [(F.softmax(self.conv1.weight, dim=1)).detach()] # weights for combining adjacency matrices
         return H,W
 
 class GTConv(nn.Module):
@@ -122,7 +131,7 @@ class GTConv(nn.Module):
         super(GTConv, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.weight = nn.Parameter(torch.Tensor(out_channels,in_channels,1,1))
+        self.weight = nn.Parameter(torch.Tensor(out_channels,in_channels,1,1)) # 1x1 convolution matrix
         self.bias = None
         self.scale = nn.Parameter(torch.Tensor([0.1]), requires_grad=False)
         self.reset_parameters()
@@ -135,5 +144,7 @@ class GTConv(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, A):
-        A = torch.sum(A*F.softmax(self.weight, dim=1), dim=1)
+        # A.shape = (1,K,N, N)
+        # weight.shape = (O, K, 1, 1)
+        A = torch.sum(A*F.softmax(self.weight, dim=1), dim=1) # combine adjacency matrices, not the sparse version so we don't have temperature
         return A
